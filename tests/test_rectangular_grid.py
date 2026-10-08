@@ -127,11 +127,13 @@ class TestCBSRectangular(unittest.TestCase):
             steps = np.abs(np.diff(path, axis=0))
             self.assertTrue(np.all(np.isin(steps[:, 0], [0, width])))
             self.assertTrue(np.all(np.isin(steps[:, 1], [0, height])))
-        # No two agents ever come within twice the robot radius
-        for t in range(paths.shape[1]):
+        # No two agents ever come within twice the robot radius. Paths are not padded:
+        # an agent whose path has ended waits on its goal.
+        for t in range(max(len(path) for path in paths)):
             for i in range(len(paths)):
                 for j in range(i + 1, len(paths)):
-                    self.assertGreater(Planner.dist(paths[i][t], paths[j][t]),
+                    self.assertGreater(Planner.dist(Planner.position_at(paths[i], t),
+                                                    Planner.position_at(paths[j], t)),
                                        2 * planner.robot_radius,
                                        'agents {0} and {1} collide at t={2}'.format(i, j, t))
 
@@ -142,7 +144,7 @@ class TestCBSRectangular(unittest.TestCase):
         goals = [(370, 75), (30, 25)]
         paths = planner.plan(starts, goals, assign=keep_order,
                              low_level_max_iter=2000, max_process=2)
-        self.assertEqual(paths.ndim, 3, 'no solution found')
+        self.assertEqual(len(paths), len(starts), 'no solution found')
         self.assert_valid_solution(planner, paths, starts, goals, cell)
 
     def test_four_agents_with_tall_cells(self):
@@ -152,8 +154,25 @@ class TestCBSRectangular(unittest.TestCase):
         goals = [(175, 255), (25, 255), (175, 45), (25, 45)]
         paths = planner.plan(starts, goals, assign=keep_order,
                              low_level_max_iter=2000, max_process=4)
-        self.assertEqual(paths.ndim, 3, 'no solution found')
+        self.assertEqual(len(paths), len(starts), 'no solution found')
         self.assert_valid_solution(planner, paths, starts, goals, cell)
+
+    def test_agent_steps_off_its_goal_to_let_another_pass(self):
+        # Agent 0 starts on its goal (3, 0) in a corridor along y=0 that agent 1 must cross;
+        # (3, 1) is the only free cell off the corridor. Agent 0 has to leave its goal and
+        # come back, which needs the goal constraints in Planner.calculate_constraints and
+        # RectSTPlanner.plan's can_stay: without them CBS finds no plan. A radius below 0.5,
+        # as in the warehouse, uses RectSTPlanner's own search, the one with can_stay.
+        cell = (1, 1)
+        walls = [(x, 1) for x in range(7) if x != 3]
+        planner = Planner(1, 0.45, walls, bounds=(0, 7, 0, 2), allow_diagonal=False)
+        starts = [(3, 0), (0, 0)]
+        goals = [(3, 0), (6, 0)]
+        paths = planner.plan(starts, goals, assign=keep_order,
+                             low_level_max_iter=2000, max_process=1)
+        self.assertEqual(len(paths), len(starts), 'no solution found')
+        self.assert_valid_solution(planner, paths, starts, goals, cell)
+        self.assertTrue(any(tuple(p) != goals[0] for p in paths[0]), 'agent 0 never left its goal')
 
 
 if __name__ == '__main__':

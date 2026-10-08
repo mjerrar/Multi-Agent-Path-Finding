@@ -3,15 +3,22 @@
 Author: Haoran Peng
 Email: gavinsweden@gmail.com
 '''
-from typing import Tuple
+from typing import Sequence, Tuple
 import numpy as np
 
 
 class Agent:
 
-    def __init__(self, start: Tuple[int, int], goal: Tuple[int, int]):
+    '''
+    offsets are the cells the agent covers relative to its own position, in the same units:
+    (0, 0) for the agent itself, plus e.g. the cells of pallets docked to it. They move with
+    the agent and need a planner with 2 * robot_radius < 1 (see Planner).
+    '''
+    def __init__(self, start: Tuple[int, int], goal: Tuple[int, int],
+                 offsets: Sequence[Tuple[int, int]] = ((0, 0),)):
         self.start = np.array(start)
         self.goal = np.array(goal)
+        self.offsets = tuple((int(dx), int(dy)) for dx, dy in offsets)
 
     # Uniquely identify an agent with its start position
     def __hash__(self):

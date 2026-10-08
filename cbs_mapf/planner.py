@@ -27,6 +27,9 @@ class Planner:
     bounds is (minx, maxx, miny, maxy) with exclusive maxima; by default the map edges
     are the outermost static obstacles. allow_diagonal=False permits only right, left,
     down and up moves.
+    With 2 * robot_radius < 1, agents collide only when they cover the same cell at the same
+    time, and an agent can cover several cells (Agent.offsets), e.g. a robot carrying pallets.
+    Otherwise agents are points that collide within 2 * robot_radius of each other.
     '''
     def __init__(self, grid_size: GridSize,
                        robot_radius: int,
@@ -35,6 +38,7 @@ class Planner:
                        allow_diagonal: bool = True):
 
         self.robot_radius = robot_radius
+        self.cell_conflicts = 2 * robot_radius < 1
         self.st_planner = RectSTPlanner(grid_size, robot_radius, static_obstacles,
                                         bounds, allow_diagonal)
 
@@ -55,6 +59,8 @@ class Planner:
 
         # Do goal assignment
         self.agents = assign(starts, goals)
+        if not self.cell_conflicts and any(agent.offsets != ((0, 0),) for agent in self.agents):
+            raise ValueError('Agents covering several cells (Agent.offsets) need 2 * robot_radius < 1')
 
         constraints = Constraints()
 
@@ -193,10 +199,38 @@ class Planner:
         # Check until the longer path ends: an agent that has arrived stays on its
         # goal, so it can still be hit by the other agent.
         for idx in range(max(len(path_i), len(path_j))):
-            if self.dist(self.position_at(path_i, idx), self.position_at(path_j, idx)) > 2*self.robot_radius:
+            if self.conflict_cell(agent_i, path_i, agent_j, path_j, idx) is None:
                 continue
             return idx
         return -1
+
+    '''
+    Where agent_i collides with agent_j at a time step, or None. With cell conflicts, a cell
+    both cover; otherwise the position of agent_j, if within 2 * robot_radius of agent_i.
+    '''
+    def conflict_cell(self, agent_i: Agent, path_i: np.ndarray,
+                            agent_j: Agent, path_j: np.ndarray, time: int) -> Optional[Tuple[int, int]]:
+        position_i, position_j = self.position_at(path_i, time), self.position_at(path_j, time)
+        if self.cell_conflicts:
+            overlap = self.footprint(agent_i, position_i) & self.footprint(agent_j, position_j)
+            return min(overlap) if overlap else None
+        if self.dist(position_i, position_j) > 2*self.robot_radius:
+            return None
+        return tuple(position_j.tolist())
+
+    '''
+    Whether an agent at position covers cell (with point agents, comes within 2 * robot_radius of it)
+    '''
+    def covers(self, agent: Agent, position: np.ndarray, cell: Tuple[int, int]) -> bool:
+        if self.cell_conflicts:
+            return cell in self.footprint(agent, position)
+        return self.dist(position, np.array(cell)) < 2*self.robot_radius
+
+    @staticmethod
+    def footprint(agent: Agent, position: np.ndarray) -> Set[Tuple[int, int]]:
+        '''The cells an agent at position covers: its own and those at its offsets.'''
+        x, y = int(position[0]), int(position[1])
+        return {(x + dx, y + dy) for dx, dy in agent.offsets}
 
     @staticmethod
     def position_at(path: np.ndarray, time: int) -> np.ndarray:
@@ -214,15 +248,18 @@ class Planner:
         contrained_path = node.solution[constrained_agent]
         unchanged_path = node.solution[unchanged_agent]
 
-        pivot = self.position_at(unchanged_path, time_of_conflict)
+        # The cell the constrained agent must keep off. The low level planner checks every
+        # cell an agent covers against its constraints, so this holds for carried pallets too
+        pivot = self.conflict_cell(constrained_agent, contrained_path,
+                                   unchanged_agent, unchanged_path, time_of_conflict)
         conflict_end_time = time_of_conflict
         while conflict_end_time < len(contrained_path) and \
-                self.dist(contrained_path[conflict_end_time], pivot) < 2*self.robot_radius:
+                self.covers(constrained_agent, contrained_path[conflict_end_time], pivot):
             conflict_end_time += 1
         # An agent already waiting on its goal is past the end of its path: still constrain
         # the time of conflict, or the child node would repeat its parent
         conflict_end_time = max(conflict_end_time, time_of_conflict + 1)
-        return node.constraints.fork(constrained_agent, tuple(pivot.tolist()), time_of_conflict, conflict_end_time)
+        return node.constraints.fork(constrained_agent, pivot, time_of_conflict, conflict_end_time)
 
     def calculate_goal_times(self, node: CTNode, agent: Agent, agents: List[Agent]):
         solution = node.solution
@@ -231,7 +268,8 @@ class Planner:
             if other_agent == agent:
                 continue
             time = len(solution[other_agent]) - 1
-            goal_times.setdefault(time, set()).add(tuple(solution[other_agent][time]))
+            # Every cell the other agent covers once it waits on its goal
+            goal_times.setdefault(time, set()).update(self.footprint(other_agent, solution[other_agent][time]))
         return goal_times
 
     '''
@@ -240,12 +278,13 @@ class Planner:
     def calculate_path(self, agent: Agent, 
                        constraints: Constraints, 
                        goal_times: Dict[int, Set[Tuple[int, int]]]) -> np.ndarray:
-        return self.st_planner.plan(agent.start, 
-                                    agent.goal, 
-                                    constraints.setdefault(agent, dict()), 
+        return self.st_planner.plan(agent.start,
+                                    agent.goal,
+                                    constraints.setdefault(agent, dict()),
                                     semi_dynamic_obstacles=goal_times,
-                                    max_iter=self.low_level_max_iter, 
-                                    debug=self.debug)
+                                    max_iter=self.low_level_max_iter,
+                                    debug=self.debug,
+                                    offsets=agent.offsets)
 
     '''
     Reformat the solution to a list of paths in agent order, each at its own (minimum)

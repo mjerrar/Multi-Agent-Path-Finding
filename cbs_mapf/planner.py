@@ -6,29 +6,37 @@ Email: gavinsweden@gmail.com
 An implementation of multi-agent path finding using conflict-based search
 [Sharon et al., 2015]
 '''
-from typing import List, Tuple, Dict, Callable, Set
+from typing import List, Optional, Tuple, Dict, Callable, Set
 import multiprocessing as mp
 from heapq import heappush, heappop
 from itertools import combinations
 from copy import deepcopy
 import numpy as np
 
-# The low level planner for CBS is the Space-Time A* planner
-# https://github.com/GavinPHR/Space-Time-AStar
-from stastar.planner import Planner as STPlanner
-
 from .constraint_tree import CTNode
 from .constraints import Constraints
 from .agent import Agent
+# The low level planner for CBS is the Space-Time A* planner
+# https://github.com/GavinPHR/Space-Time-AStar, extended to rectangular grid cells
+from .grid import Bounds, GridSize, RectSTPlanner
 from .assigner import *
 class Planner:
 
-    def __init__(self, grid_size: int,
+    '''
+    grid_size is either a side length for square cells or (cell_width, cell_height).
+    bounds is (minx, maxx, miny, maxy) with exclusive maxima; by default the map edges
+    are the outermost static obstacles. allow_diagonal=False permits only right, left,
+    down and up moves.
+    '''
+    def __init__(self, grid_size: GridSize,
                        robot_radius: int,
-                       static_obstacles: List[Tuple[int, int]]):
+                       static_obstacles: List[Tuple[int, int]],
+                       bounds: Optional[Bounds] = None,
+                       allow_diagonal: bool = True):
 
         self.robot_radius = robot_radius
-        self.st_planner = STPlanner(grid_size, robot_radius, static_obstacles)
+        self.st_planner = RectSTPlanner(grid_size, robot_radius, static_obstacles,
+                                        bounds, allow_diagonal)
 
     '''
     You can use your own assignment function, the default algorithm greedily assigns
@@ -60,37 +68,71 @@ class Planner:
             # Min heap for quick extraction
             open.append(node)
 
-        manager = mp.Manager()
         iter_ = 0
-        while open and iter_ < max_iter:
-            iter_ += 1
-
-            results = manager.list([])
-
-            processes = []
-
-            # Default to 10 processes maximum
-            for _ in range(max_process if len(open) > max_process else len(open)):
-                p = mp.Process(target=self.search_node, args=[heappop(open), results])
-                processes.append(p)
-                p.start()
-
-            for p in processes:
-                p.join()
-
-            for result in results:
-                if len(result) == 1:
+        if max_process <= 1:
+            # Search in this process: no worker or manager processes, so Ctrl+C
+            # stops it like any other Python code.
+            while open and iter_ < max_iter:
+                iter_ += 1
+                results = []
+                self.search_node(heappop(open), results)
+                paths = self.collect_results(results, open)
+                if paths is not None:
                     if debug:
-                        print('CBS_MAPF: Paths found after about {0} iterations'.format(4 * iter_))
-                    return result[0]
-                if result[0]:
-                    heappush(open, result[0])
-                if result[1]:
-                    heappush(open, result[1])
+                        print('CBS_MAPF: Paths found after {0} iterations'.format(iter_))
+                    return paths
+        else:
+            manager = mp.Manager()
+            processes = []
+            try:
+                while open and iter_ < max_iter:
+                    iter_ += 1
+
+                    results = manager.list([])
+
+                    processes = []
+
+                    # Default to 10 processes maximum
+                    for _ in range(max_process if len(open) > max_process else len(open)):
+                        # daemon: exiting the main process never waits for a worker
+                        p = mp.Process(target=self.search_node, args=[heappop(open), results],
+                                       daemon=True)
+                        processes.append(p)
+                        p.start()
+
+                    for p in processes:
+                        p.join()
+
+                    paths = self.collect_results(results, open)
+                    if paths is not None:
+                        if debug:
+                            print('CBS_MAPF: Paths found after about {0} iterations'.format(4 * iter_))
+                        return paths
+            finally:
+                # Also runs on Ctrl+C: stop any workers left and the manager process
+                for p in processes:
+                    if p.is_alive():
+                        p.terminate()
+                manager.shutdown()
 
         if debug:
             print('CBS-MAPF: Open set is empty, no paths found.')
         return np.array([])
+
+    '''
+    Return the paths if a search result is a solution; otherwise push the
+    result's child nodes onto the open set and return None.
+    '''
+    @staticmethod
+    def collect_results(results, open) -> Optional[np.ndarray]:
+        for result in results:
+            if len(result) == 1:
+                return result[0]
+            if result[0]:
+                heappush(open, result[0])
+            if result[1]:
+                heappush(open, result[1])
+        return None
 
     '''
     Abstracted away the cbs search for multiprocessing.
@@ -147,11 +189,19 @@ class Planner:
 
 
     def safe_distance(self, solution: Dict[Agent, np.ndarray], agent_i: Agent, agent_j: Agent) -> int:
-        for idx, (point_i, point_j) in enumerate(zip(solution[agent_i], solution[agent_j])):
-            if self.dist(point_i, point_j) > 2*self.robot_radius:
+        path_i, path_j = solution[agent_i], solution[agent_j]
+        # Check until the longer path ends: an agent that has arrived stays on its
+        # goal, so it can still be hit by the other agent.
+        for idx in range(max(len(path_i), len(path_j))):
+            if self.dist(self.position_at(path_i, idx), self.position_at(path_j, idx)) > 2*self.robot_radius:
                 continue
             return idx
         return -1
+
+    @staticmethod
+    def position_at(path: np.ndarray, time: int) -> np.ndarray:
+        '''Where an agent is at a time step; after its path ends it waits on its goal.'''
+        return path[min(time, len(path) - 1)]
 
     @staticmethod
     def dist(point1: np.ndarray, point2: np.ndarray) -> int:
@@ -164,13 +214,14 @@ class Planner:
         contrained_path = node.solution[constrained_agent]
         unchanged_path = node.solution[unchanged_agent]
 
-        pivot = unchanged_path[time_of_conflict]
+        pivot = self.position_at(unchanged_path, time_of_conflict)
         conflict_end_time = time_of_conflict
-        try:
-            while self.dist(contrained_path[conflict_end_time], pivot) < 2*self.robot_radius:
-                conflict_end_time += 1
-        except IndexError:
-            pass
+        while conflict_end_time < len(contrained_path) and \
+                self.dist(contrained_path[conflict_end_time], pivot) < 2*self.robot_radius:
+            conflict_end_time += 1
+        # An agent already waiting on its goal is past the end of its path: still constrain
+        # the time of conflict, or the child node would repeat its parent
+        conflict_end_time = max(conflict_end_time, time_of_conflict + 1)
         return node.constraints.fork(constrained_agent, tuple(pivot.tolist()), time_of_conflict, conflict_end_time)
 
     def calculate_goal_times(self, node: CTNode, agent: Agent, agents: List[Agent]):
@@ -197,15 +248,13 @@ class Planner:
                                     debug=self.debug)
 
     '''
-    Reformat the solution to a numpy array
+    Reformat the solution to a list of paths in agent order, each at its own (minimum)
+    length, not padded. An agent whose path ends first waits on its goal: the conflict
+    checks above already assume that (position_at), so the paths stay collision-free.
     '''
     @staticmethod
     def reformat(agents: List[Agent], solution: Dict[Agent, np.ndarray]):
-        solution = Planner.pad(solution)
-        reformatted_solution = []
-        for agent in agents:
-            reformatted_solution.append(solution[agent])
-        return np.array(reformatted_solution)
+        return [solution[agent] for agent in agents]
 
     '''
     Pad paths to equal length, inefficient but well..

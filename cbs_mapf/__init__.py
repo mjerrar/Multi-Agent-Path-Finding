@@ -8,3 +8,4 @@ from . import assigner
 from . import agent
 from . import constraint_tree
 from . import constraints
+from . import grid

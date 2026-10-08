@@ -99,7 +99,8 @@ class RectSTPlanner(STPlanner):
 
         self.grid_size = cell_dimensions(grid_size)
         self.robot_radius = robot_radius
-        np_static_obstacles = np.array(static_obstacles)
+        # Shaped (n, 2) even for no obstacles, which is fine once bounds set the map edges
+        np_static_obstacles = np.array(static_obstacles).reshape(-1, 2)
         self.static_obstacles = KDTree(np_static_obstacles)
 
         self.grid = Grid(grid_size, np_static_obstacles, bounds)
@@ -111,6 +112,10 @@ class RectSTPlanner(STPlanner):
         self._neighbours = {(int(key[0]), int(key[1])): [(int(x), int(y)) for x, y in cells]
                             for key, cells in self.neighbour_table.table.items()}
         self.set_reserved({})
+
+    def safe_static(self, grid_pos: np.ndarray) -> bool:
+        # The inherited check looks up the nearest obstacle, which fails when there is none
+        return self.static_obstacles.n == 0 or super().safe_static(grid_pos)
 
     '''
     Cells taken by something outside the search (e.g. a robot carrying a pallet on a fixed

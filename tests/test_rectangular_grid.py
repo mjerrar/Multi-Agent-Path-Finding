@@ -111,6 +111,14 @@ class TestRectSTPlanner(unittest.TestCase):
         self.assertTrue(np.all(np.isin(steps[:, 0], [0, 20])))
         self.assertTrue(np.all(np.isin(steps[:, 1], [0, 10])))
 
+    def test_no_static_obstacles_with_bounds(self):
+        # e.g. a warehouse whose only pallet is docked to a robot. Both the planner's own
+        # search (radius below 0.5) and the inherited one (larger radius) find a path
+        for radius in (0.45, 3):
+            planner = RectSTPlanner(10, radius, [], bounds=(0, 100, 0, 50))
+            path = planner.plan((5, 5), (95, 45), dict(), max_iter=1000)
+            np.testing.assert_array_equal(path[-1], [95, 45])
+
 
 class TestCBSRectangular(unittest.TestCase):
 
